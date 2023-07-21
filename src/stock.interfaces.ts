@@ -5,7 +5,7 @@ export type StockPriceData = {
   movingAverage: number;
 };
 
-export type StockData = {
+export interface StockData {
   c: number;
   d: number;
   dp: number;
@@ -14,4 +14,4 @@ export type StockData = {
   o: number;
   pc: number;
   t: number;
-};
+}

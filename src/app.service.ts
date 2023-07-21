@@ -3,36 +3,52 @@ import { HttpException, HttpStatus, Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { firstValueFrom } from 'rxjs';
 import { StockData, StockPriceData } from './stock.interfaces';
+import { StocksDataEntity } from './stock-data.entity';
+import { EntityManager, Repository } from 'typeorm';
+import { InjectRepository } from '@nestjs/typeorm';
+import { StockSymbolEntity } from './stock-symbol.entity';
 
 @Injectable()
 export class AppService {
   private readonly logger = new Logger(AppService.name);
-  private readonly finnHubBaseUrl = 'finnhub.io/api/v1';
+  private readonly finnHubBaseUrl = '//finnhub.io/api/v1';
   private readonly finnHubApiKey = 'ciqlqj9r01qjff7cr300ciqlqj9r01qjff7cr30g';
-  private stocksData: { [symbol: string]: Array<StockData> } = {};
-  constructor(private httpService: HttpService) {}
+  private readonly manager: EntityManager;
+  constructor(
+    private readonly httpService: HttpService,
+    @InjectRepository(StocksDataEntity) private readonly stocksDataRepository: Repository<StocksDataEntity>,
+    @InjectRepository(StockSymbolEntity) private readonly stockSymbolRepository: Repository<StockSymbolEntity>
+  ) {
+    this.manager = this.stockSymbolRepository.manager;
+  }
 
   @Cron(CronExpression.EVERY_MINUTE)
   private async handleCron() {
-    for (const symbol in this.stocksData) {
-      const stock = await this.getStock(symbol);
-      if ((stock as Error).message) {
-        this.logger.error((stock as Error).message);
-      } else {
-        this.stocksData[symbol].push(stock as StockData);
-        if (this.stocksData[symbol].length > 10) {
-          this.stocksData[symbol].shift();
+    this.stockSymbolRepository.find().then((symbols) => {
+      symbols.forEach(async (symbol) => {
+        const stock = await this.getStock(symbol.name);
+        if ((stock as Error).message) {
+          this.logger.error((stock as Error).message);
+        } else {
+          await this.stocksDataRepository.save({ ...(stock as StockData), symbol });
+          await this.stocksDataRepository.findAndCount({ where: { symbol: { name: symbol.name } } }).then(([data, count]) => {
+            if (count > 10) this.stocksDataRepository.delete(data[0]);
+          });
         }
-      }
-    }
+      });
+    });
   }
 
   private async getStock(symbol: string): Promise<StockData | Error> {
     try {
       const response = await firstValueFrom(this.httpService.get(`${this.finnHubBaseUrl}/quote?symbol=${symbol}&token=${this.finnHubApiKey}`));
       this.logger.debug(response.data);
+      if (response.data.d === null) {
+        this.deleteStock(symbol);
+        this.logger.error(response.data);
+        return new Error('Symbol not available');
+      }
       if (response.status === 429) {
-        this.logger.error('response.data');
         this.logger.error(response.data);
 
         const secondsToWait = Number(response.headers['retry-after']);
@@ -47,12 +63,13 @@ export class AppService {
   }
 
   public async addStockSymbol(symbol: string) {
-    if (!this.stocksData[symbol]) {
+    const isSymbolExists = await this.manager.exists(StockSymbolEntity, { where: { name: symbol } });
+    if (!isSymbolExists) {
       const stock = await this.getStock(symbol);
       if ((stock as Error).message) {
         throw new HttpException((stock as Error).message, HttpStatus.INTERNAL_SERVER_ERROR);
       }
-      this.stocksData[symbol] = [stock as StockData];
+      await this.stockSymbolRepository.save({ name: symbol });
       this.logger.debug(`Adding ${symbol} to watchlist`);
       return `${symbol} added to watchlist`;
     }
@@ -60,35 +77,41 @@ export class AppService {
   }
 
   public async getStockData(symbol: string): Promise<StockPriceData | string> {
-    const length = this.stocksData[symbol]?.length;
+    const isSymbolExists = await this.manager.exists(StockSymbolEntity, { where: { name: symbol } });
+    if (!isSymbolExists) {
+      return 'You should add the symbol first';
+    }
+    const [data, length] = await this.stocksDataRepository.findAndCount({ where: { symbol: { name: symbol } }, take: 10, order: { id: 'DESC' } });
     if (length) {
       return {
         symbol,
-        price: this.stocksData[symbol][length - 1].c,
-        lastUpdated: new Date(this.stocksData[symbol][length - 1].t * 1000),
-        movingAverage: this.calculateMovingAverage(symbol),
+        price: data[0].c,
+        lastUpdated: new Date(data[0].t * 1000),
+        movingAverage: this.calculateMovingAverage(data),
       };
     } else {
-      return length === 0 ? 'chron not yet runs' : 'You should add the symbol first';
+      return 'Chron not yet runs';
     }
   }
 
   public async deleteStock(symbol: string) {
     this.logger.debug(`Deleting ${symbol}`);
-    if (this.stocksData[symbol]) {
-      this.stocksData[symbol] = null;
+
+    const isSymbolExists = await this.manager.exists(StockSymbolEntity, { where: { name: symbol } });
+    if (isSymbolExists) {
+      this.manager.delete(StockSymbolEntity, { name: symbol });
       return 'Symbol deleted from watchlist';
     } else {
       return 'You should add the symbol first';
     }
   }
 
-  private calculateMovingAverage(symbol: string) {
+  private calculateMovingAverage(data: StocksDataEntity[]) {
     let sum = 0;
-    this.stocksData[symbol].forEach((stock) => {
+    data.forEach((stock) => {
       sum += stock.c;
     });
-    return sum / this.stocksData[symbol].length;
+    return sum / data.length;
   }
 
   public getHello(): string {
